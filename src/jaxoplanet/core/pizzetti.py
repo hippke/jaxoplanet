@@ -24,7 +24,9 @@ the truncation error has the rigorous bound
 which increases with ``z``. A single cut ``z_c`` per light curve, found by bisection,
 therefore guarantees a given accuracy for every point with ``z <= z_c``. The points
 beyond the cut (near the stellar limb) are computed with the solution of Agol et al.
-(2020) from :mod:`jaxoplanet.core.limb_dark` on a compacted array.
+(2020) from :mod:`jaxoplanet.core.limb_dark` on a compacted array. For laws with many
+coefficients and many such points, power series about first and second contact
+(:mod:`jaxoplanet.core.pizzetti_contact`) are used instead where they are accurate.
 """
 
 __all__ = ["light_curve"]
@@ -38,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.scipy.special import logsumexp
 
+from jaxoplanet.core import pizzetti_contact as _contact
 from jaxoplanet.core.limb_dark import light_curve as _agol_light_curve
 from jaxoplanet.types import Array
 
@@ -269,8 +272,11 @@ def _capacities(nb: int) -> tuple[int, ...]:
     return tuple(sorted(caps | {nb}))
 
 
-def _compact_apply(fn: Callable[[Array], Array], z: Array, mask: Array) -> Array:
-    """``fn(z)`` evaluated only near the points selected by ``mask``, and zero elsewhere
+def _compact_update(
+    fn: Callable[[Array], Array], res: Array, z: Array, mask: Array
+) -> Array:
+    """``res`` with ``fn(z)`` written where ``mask`` is true, evaluating ``fn`` only
+    near the points selected by ``mask``
 
     JAX needs static shapes, so the blocks of ``BLOCK`` consecutive samples that
     contain a selected point are gathered into an array of one of a few fixed sizes,
@@ -282,6 +288,9 @@ def _compact_apply(fn: Callable[[Array], Array], z: Array, mask: Array) -> Array
     clustering all the blocks are selected and the cost is that of evaluating
     ``fn`` on every point.
 
+    The values are scattered into ``res`` (rather than into a new array of zeros) so
+    that several updates of the same result cost one pass over it each.
+
     Each branch is rematerialized in the backward pass (``jax.checkpoint``).
     Otherwise reverse-mode differentiation of ``lax.switch`` stores the residuals of
     every branch at the shape of the largest one, which made the gradient ~5x slower.
@@ -291,31 +300,33 @@ def _compact_apply(fn: Callable[[Array], Array], z: Array, mask: Array) -> Array
     ``custom_vmap`` rule that falls back to evaluating every point is not an option:
     it cannot be differentiated in reverse mode.) Use ``lax.map`` over the batch
     instead of ``vmap``, or ``method="agol"``.
-
-    The result is only meaningful where ``mask`` is true.
     """
     n = z.shape[0]
     nb = -(-n // BLOCK)
     if nb <= MIN_BLOCKS:
-        return jnp.where(mask, fn(jnp.where(mask, z, 0.5)), 0.0)
+        return jnp.where(mask, fn(jnp.where(mask, z, 0.5)), res)
 
     pad = nb * BLOCK - n
     zb = jnp.pad(z, (0, pad), constant_values=0.5).reshape(nb, BLOCK)
-    flag = jnp.pad(mask, (0, pad)).reshape(nb, BLOCK).any(axis=1)
+    mb = jnp.pad(mask, (0, pad)).reshape(nb, BLOCK)
+    rb = jnp.pad(res, (0, pad)).reshape(nb, BLOCK)
+    flag = mb.any(axis=1)
     caps = _capacities(nb)
 
-    def make_branch(cap: int) -> Callable[[Array], Array]:
+    def make_branch(cap: int) -> Callable[[Array, Array, Array], Array]:
         @jax.checkpoint
-        def branch(zb: Array) -> Array:
+        def branch(zb: Array, mb: Array, rb: Array) -> Array:
             idx = jnp.nonzero(flag, size=cap, fill_value=nb)[0]
             zs = jnp.take(zb, idx, axis=0, mode="fill", fill_value=0.5)
-            vals = fn(zs.reshape(-1)).reshape(cap, BLOCK)
-            return jnp.zeros_like(zb).at[idx].set(vals, mode="drop")
+            ms = jnp.take(mb, idx, axis=0, mode="fill", fill_value=False)
+            old = jnp.take(rb, idx, axis=0, mode="fill", fill_value=0.0)
+            vals = jnp.where(ms, fn(zs.reshape(-1)).reshape(cap, BLOCK), old)
+            return rb.at[idx].set(vals, mode="drop")
 
         return branch
 
     which = jnp.sum(jnp.sum(flag) > jnp.asarray(caps[:-1]))
-    out = jax.lax.switch(which, [make_branch(cap) for cap in caps], zb)
+    out = jax.lax.switch(which, [make_branch(cap) for cap in caps], zb, mb, rb)
     return out.reshape(-1)[:n]
 
 
@@ -325,8 +336,95 @@ def _limb_masked(u: Array, r: Array, z: Array, on_limb: Array, order: int) -> Ar
     return jnp.where(on_limb, _agol_light_curve(u, safe, r, order=order), 0.0)
 
 
+#: The contact expansions (see :mod:`jaxoplanet.core.pizzetti_contact`) cost ~3 ms to
+#: set up per light curve and ~1 us per limb sample, against ~0.2 us per sample for
+#: the solution of Agol et al. with two limb darkening coefficients and 2-5 us for
+#: four or more (more for higher orders). They only pay off when many samples are
+#: beyond the cut: at least ``CONTACT_LIMB / (n - 3)`` of them for a law with ``n >= 4``
+#: coefficients (measured on two CPU cores; the break-even is a rough one)
+CONTACT_LIMB = 12000
+#: The smallest number of coefficients for which the contact expansions are used
+CONTACT_MIN_COEFFS = 4
+
+
+#: The contact expansions are only compiled in for arrays at least this many times
+#: longer than the number of limb samples they need (the limb samples are usually a
+#: few percent of the samples, at most a few tens of percent)
+CONTACT_LENGTH_FACTOR = 8
+
+
+def _contact_min_limb(ncoeffs: int) -> int:
+    return CONTACT_LIMB // max(ncoeffs - 3, 1)
+
+
+def _limb_update(  # noqa: PLR0917
+    res: Array,
+    u: Array,
+    c: Array,
+    z: Array,
+    r: Array,
+    z_c: Array,
+    on_limb: Array,
+    order: int,
+    tol: Array,
+    *,
+    contact: bool,
+    min_limb: int,
+) -> Array:
+    """``res`` with the limb part of the deficit written where ``on_limb`` is true,
+    using the contact expansions where they apply"""
+
+    def agol(zs: Array) -> Array:
+        return _agol_light_curve(u, zs, r, order=order)
+
+    if not contact:
+        return _compact_update(agol, res, z, on_limb)
+
+    n = c.shape[0]
+    gs = tuple(a / 2 for a in range(n))
+    n_limb = jnp.sum(on_limb)
+    norm = 2 * math.pi * jnp.sum(c / (jnp.arange(n) + 2))
+    proto = jax.eval_shape(lambda: _contact.build(gs, c, r, z_c, _contact.JMAX))
+
+    def setup(_: None) -> tuple[_contact.Contact, Array]:
+        ct = _contact.build(gs, c, r, z_c, _contact.JMAX)
+        fixed = jax.lax.stop_gradient(ct)
+        zp = _contact.probe_points(r, fixed)
+        got = -_contact.evaluate(fixed, r, zp) / norm
+        want = agol(zp)
+        depth = (
+            r**2 * jnp.abs(jnp.sum(c)) / (2 * jnp.abs(jnp.sum(c / (jnp.arange(n) + 2))))
+        )
+        err = jnp.max(jnp.abs(got - want))
+        ok = jnp.isfinite(err) & (err <= 0.1 * tol * depth)
+        return ct, ok
+
+    def skip(_: None) -> tuple[_contact.Contact, Array]:
+        zeros = jax.tree_util.tree_map(lambda s: jnp.zeros(s.shape, s.dtype), proto)
+        return zeros, jnp.asarray(False)
+
+    ct, ok = jax.lax.cond(n_limb >= min_limb, setup, skip, None)
+    on_contact = on_limb & ok & (z >= ct.z_lo)
+    res = _compact_update(agol, res, z, on_limb & ~on_contact)
+
+    def with_contact(res: Array) -> Array:
+        return _compact_update(
+            lambda zs: -_contact.evaluate(ct, r, zs) / norm, res, z, on_contact
+        )
+
+    return jax.lax.cond(ok, with_contact, lambda res: res, res)
+
+
 def _flat_deficit(
-    u: Array, z: Array, r: Array, order: int, tol: Array, *, compact: bool = True
+    u: Array,
+    z: Array,
+    r: Array,
+    order: int,
+    tol: Array,
+    *,
+    compact: bool = True,
+    contact: bool = True,
+    min_limb: int | None = None,
 ) -> Array:
     """Flux deficit for a one-dimensional array ``z`` and a scalar radius ratio"""
     c = mu_coefficients(u)
@@ -337,18 +435,40 @@ def _flat_deficit(
 
     # Points beyond the cut and inside the outer contact need the limb solution
     on_limb = jnp.logical_and(jnp.logical_not(in_series), z < 1 + r)
-    if compact:
-        limb = _compact_apply(
-            lambda zs: _agol_light_curve(u, zs, r, order=order), z, on_limb
-        )
-    else:
-        limb = _limb_masked(u, r, z, on_limb, order)
-    return jnp.where(in_series, series, limb)
+    if not compact:
+        return jnp.where(in_series, series, _limb_masked(u, r, z, on_limb, order))
+    res = jnp.where(in_series, series, 0.0)
+    use_contact = (
+        contact and c.dtype == jnp.float64 and u.shape[0] >= CONTACT_MIN_COEFFS
+    )
+    if min_limb is None:
+        min_limb = _contact_min_limb(u.shape[0])
+        # (a static decision: it saves the compilation time of the expansions)
+        use_contact = use_contact and z.shape[0] >= CONTACT_LENGTH_FACTOR * min_limb
+    return _limb_update(
+        res,
+        u,
+        c,
+        z,
+        r,
+        z_c,
+        on_limb,
+        order,
+        tol,
+        contact=use_contact,
+        min_limb=min_limb,
+    )
 
 
-@partial(jax.jit, static_argnames=("order",))
+@partial(jax.jit, static_argnames=("order", "contact"))
 def light_curve(
-    u: Array, b: Array, r: Array, *, order: int = 40, series_tol: float = 1e-10
+    u: Array,
+    b: Array,
+    r: Array,
+    *,
+    order: int = 40,
+    series_tol: float = 1e-10,
+    contact: bool = True,
 ) -> Array:
     """The flux deficit (flux minus one) for polynomial limb darkening
 
@@ -366,6 +486,12 @@ def light_curve(
         series_tol (float): The bound on the truncation error of the series
             relative to the central depth of the transit. It is raised to a few
             times the machine precision of the working dtype if lower.
+        contact (bool): Use the contact expansions of
+            :mod:`jaxoplanet.core.pizzetti_contact` for the points near the limb
+            when they pay off: float64, at least four coefficients and many limb
+            samples (see :data:`CONTACT_LIMB`). They are accepted only if they
+            reproduce the solution of Agol et al. to a tenth of ``series_tol`` (relative
+            to the central depth) at points chosen where they are least accurate.
 
     The speed-up comes from evaluating the limb solution on a short array that is
     gathered at run time. It therefore needs ``b`` to be roughly ordered in time
@@ -392,7 +518,9 @@ def light_curve(
     tol = jnp.maximum(jnp.asarray(series_tol, dtype=dtype), 8 * jnp.finfo(dtype).eps)
 
     if r.ndim == 0:
-        return _flat_deficit(u, b.reshape(-1), r, order, tol).reshape(b.shape)
+        return _flat_deficit(u, b.reshape(-1), r, order, tol, contact=contact).reshape(
+            b.shape
+        )
 
     shape = jnp.broadcast_shapes(b.shape, r.shape)
     bb = jnp.broadcast_to(b, shape).reshape(-1)
